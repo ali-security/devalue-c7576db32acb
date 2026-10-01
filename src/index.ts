@@ -116,10 +116,10 @@ export default function devalue(value: any) {
 
 			case 'Array': {
 				// For dense arrays (no holes), we iterate normally.
-				// When we encounter the first hole, we call Object.keys
+				// When we encounter the first hole, we collect own indices
 				// to determine the sparseness, then decide between:
 				//   - Array literal with holes: [,"a",,] (default)
-				//   - Object.assign: Object.assign(Array(n),{...}) (for very sparse arrays)
+				//   - Object.assign with a sparse-safe allocator (for very sparse arrays)
 				// Only the Object.assign path avoids iterating every slot, which
 				// is what protects against the DoS of e.g. `arr[1000000] = 1`.
 				let hasHoles = false;
@@ -140,10 +140,11 @@ export default function devalue(value: any) {
 						//
 						// Object.assign: populated indices are listed explicitly.
 						// For example, [, "a", ,] would be written as
-						// Object.assign(Array(3),{1:"a"}). This avoids paying
-						// per-hole, but has a large fixed overhead for the
-						// "Object.assign(Array(n),{...})" wrapper, and each
-						// element costs extra chars for its index and colon.
+						// Object.assign(sparse(3),{1:"a"}), where sparse(n) stands
+						// for the expression emitted by stringifySparseArray(n).
+						// This avoids paying per-hole, but has a large fixed
+						// overhead for the allocator and Object.assign wrapper,
+						// and each element costs extra chars for its index and colon.
 						//
 						// The serialized values are the same size either way, so
 						// the choice comes down to the structural overhead:
@@ -154,32 +155,34 @@ export default function devalue(value: any) {
 						//     = L + 2
 						//
 						//   Object.assign overhead:
-						//     "Object.assign(Array(" — 20 chars
-						//     + length              — d chars
-						//     + "),{"               — 3 chars
+						//     "Object.assign("      — 14 chars
+						//     + allocator expression — A chars
+						//     + ",{"                 — 2 chars
 						//     + for each populated element:
-						//       index + ":" + ","   — (d + 2) chars
-						//     + "})"                — 2 chars
-						//     = (25 + d) + P * (d + 2)
+						//       index + ":" + ","     — (d + 2) chars
+						//     + "})"                 — 2 chars
+						//     = (18 + A) + P * (d + 2)
 						//
 						// where L is the array length, P is the number of
-						// populated elements, and d is the number of digits
-						// in L (an upper bound on the digits in any index).
+						// populated elements, A is the allocator expression's
+						// length, and d is the number of digits in L (an upper
+						// bound on the digits in any index).
 						//
 						// Object.assign is cheaper when:
-						//   (25 + d) + P * (d + 2) < L + 2
+						//   (18 + A) + P * (d + 2) < L + 2
 						const populatedKeys = validArrayIndices(thing);
 						const population = populatedKeys.length;
 						const d = String(thing.length).length;
+						const array = stringifySparseArray(thing.length);
 
 						const holeCost = thing.length + 2;
-						const sparseCost = (25 + d) + population * (d + 2);
+						const sparseCost = array.length + 18 + population * (d + 2);
 
 						if (holeCost > sparseCost) {
 							const entries = populatedKeys
 								.map(k => `${k}:${stringify(thing[k])}`)
 								.join(',');
-							return `Object.assign(Array(${thing.length}),{${entries}})`;
+							return `Object.assign(${array},{${entries}})`;
 						}
 
 						hasHoles = true;
@@ -188,7 +191,7 @@ export default function devalue(value: any) {
 					// (the comma separator is all we need — no content for this position)
 				}
 
-				const tail = thing.length === 0 || (thing.length - 1 in thing) ? '' : ',';
+				const tail = thing.length === 0 || Object.prototype.hasOwnProperty.call(thing, thing.length - 1) ? '' : ',';
 				return result + tail + ']';
 			}
 
@@ -241,14 +244,22 @@ export default function devalue(value: any) {
 					values.push(`new Date(${thing.getTime()})`);
 					break;
 
-				case 'Array':
-					values.push(`Array(${thing.length})`);
+				case 'Array': {
+					const populatedKeys = validArrayIndices(thing);
+					// Only preallocate when the length is bounded by the number
+					// of populated elements, plus a small constant for short arrays.
+					values.push(
+						thing.length > 32 + 2 * populatedKeys.length
+							? stringifySparseArray(thing.length)
+							: `Array(${thing.length})`
+					);
 					// Only visit populated indices, so that very sparse arrays
 					// don't cost time proportional to thing.length
-					validArrayIndices(thing).forEach(i => {
+					populatedKeys.forEach(i => {
 						statements.push(`${name}[${i}]=${stringify(thing[i])}`);
 					});
 					break;
+				}
 
 				case 'Set':
 					values.push(`new Set`);
@@ -331,6 +342,19 @@ function validArrayIndices(array: any[]) {
 	}
 	keys.length = i + 1;
 	return keys;
+}
+
+// the largest valid array index, i.e. 2 ** 32 - 2
+const MAX_ARRAY_INDEX = 4294967294;
+
+/**
+ * Emit an array whose storage is not proportional to its declared length.
+ * Touching and deleting the largest valid index forces V8 into
+ * dictionary-elements mode before setting the length.
+ * Merely starting with [] and assigning .length still eagerly allocates.
+ */
+function stringifySparseArray(length: number) {
+	return `(function(a){a[${MAX_ARRAY_INDEX}]=0;delete a[${MAX_ARRAY_INDEX}];a.length=${length};return a}([]))`;
 }
 
 function escapeUnsafeChar(c: string) {
