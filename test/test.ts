@@ -30,6 +30,15 @@ describe('devalue', () => {
 		test('Array', ['a', 'b', 'c'], '["a","b","c"]');
 		test('Array (empty)', [], '[]');
 		test('Array (sparse)', [,'b',,], '[,"b",,]');
+		test('Array (very sparse)', ((arr: any[]) => {
+			arr[1000000] = 'x';
+			return arr;
+		})([]), 'Object.assign(Array(1000001),{1000000:"x"})');
+		test('Array (very sparse, multiple values)', ((arr: any[]) => {
+			arr[10] = 'a';
+			arr[20] = 'b';
+			return arr;
+		})([]), '[,,,,,,,,,,"a",,,,,,,,,,"b"]');
 		test('Object', {foo: 'bar', 'x-y': 'z'}, '{foo:"bar","x-y":"z"}');
 		test('Set', new Set([1, 2, 3]), 'new Set([1,2,3])');
 		test('Map', new Map([['a', 'b']]), 'new Map([["a","b"]])');
@@ -80,6 +89,165 @@ describe('devalue', () => {
 	describe('repetition', () => {
 		let str = 'a string';
 		test('String (repetition)', [str, str], `(function(a){return [a,a]}("a string"))`);
+	});
+
+	describe('sparse arrays', () => {
+		// the largest valid array index, i.e. an array of length 2 ** 32 - 1
+		const MAX_INDEX = 4294967294;
+
+		function evaluate(js: string): any {
+			return vm.runInThisContext(`(${js})`);
+		}
+
+		it('round-trips very sparse arrays', () => {
+			const arr: any[] = [];
+			arr[1000000] = 'x';
+
+			const value = evaluate(devalue(arr));
+			assert.equal(value.length, 1000001);
+			assert.equal(value[1000000], 'x');
+			assert.ok(!(0 in value));
+			assert.ok(!(999999 in value));
+		});
+
+		it('round-trips very sparse arrays with multiple values', () => {
+			const arr: any[] = [];
+			arr[10] = 'a';
+			arr[20] = 'b';
+
+			const value = evaluate(devalue(arr));
+			assert.equal(value.length, 21);
+			assert.equal(value[10], 'a');
+			assert.equal(value[20], 'b');
+			assert.ok(!(0 in value));
+			assert.ok(!(9 in value));
+			assert.ok(!(11 in value));
+		});
+
+		it('handles very sparse arrays efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = 'x';
+
+			// This should complete nearly instantly, not iterate 4 billion times
+			const start = Date.now();
+			const js = devalue(arr);
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `Object.assign(Array(${MAX_INDEX + 1}),{${MAX_INDEX}:"x"})`);
+
+			// Verify round-trip
+			const value = evaluate(js);
+			assert.equal(value.length, MAX_INDEX + 1);
+			assert.equal(value[MAX_INDEX], 'x');
+			assert.ok(!(0 in value));
+		});
+
+		it('handles repeated very sparse arrays efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = 'x';
+
+			const start = Date.now();
+			const js = devalue([arr, arr]);
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `(function(a){a[${MAX_INDEX}]="x";return [a,a]}(Array(${MAX_INDEX + 1})))`);
+
+			const value = evaluate(js);
+			assert.equal(value[0], value[1]);
+			assert.equal(value[0].length, MAX_INDEX + 1);
+			assert.equal(value[0][MAX_INDEX], 'x');
+			assert.ok(!(0 in value[0]));
+		});
+
+		it('handles cyclical very sparse arrays efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = arr;
+
+			const start = Date.now();
+			const js = devalue(arr);
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `(function(a){a[${MAX_INDEX}]=a;return a}(Array(${MAX_INDEX + 1})))`);
+
+			const value = evaluate(js);
+			assert.equal(value.length, MAX_INDEX + 1);
+			assert.equal(value[MAX_INDEX], value);
+			assert.ok(!(0 in value));
+		});
+
+		it('handles very sparse arrays nested in objects efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = { foo: 'bar' };
+
+			const start = Date.now();
+			const js = devalue({ arr });
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `{arr:Object.assign(Array(${MAX_INDEX + 1}),{${MAX_INDEX}:{foo:"bar"}})}`);
+		});
+
+		it('ignores non-numeric array properties in dense encoding', () => {
+			// Dense path (few holes — array literal wins)
+			const arr: any = [, 'a', , 'b'];
+			arr.foo = 'should be ignored';
+			arr.bar = 42;
+
+			// should produce the holey literal, no mention of "foo" or "bar"
+			const js = devalue(arr);
+			assert.ok(js.indexOf('foo') === -1, `devalue output should not contain "foo": ${js}`);
+			assert.ok(js.indexOf('bar') === -1, `devalue output should not contain "bar": ${js}`);
+			assert.ok(js.indexOf('should be ignored') === -1, `devalue output should not contain non-numeric value: ${js}`);
+			const value = evaluate(js);
+			assert.equal(value.length, 4);
+			assert.equal(value[1], 'a');
+			assert.equal(value[3], 'b');
+			assert.ok(!(0 in value));
+		});
+
+		it('ignores non-numeric array properties in sparse encoding', () => {
+			// Sparse path (very sparse — Object.assign wins)
+			const arr: any = [];
+			arr[1000000] = 'x';
+			arr.foo = 'should be ignored';
+			arr.bar = 42;
+
+			// should produce Object.assign form, no mention of "foo" or "bar"
+			const js = devalue(arr);
+			assert.ok(js.indexOf('foo') === -1, `devalue output should not contain "foo": ${js}`);
+			assert.ok(js.indexOf('bar') === -1, `devalue output should not contain "bar": ${js}`);
+			assert.ok(js.indexOf('should be ignored') === -1, `devalue output should not contain non-numeric value: ${js}`);
+			assert.ok(js.indexOf('Object.assign') !== -1, `devalue should use Object.assign for very sparse arrays`);
+			const value = evaluate(js);
+			assert.equal(value.length, 1000001);
+			assert.equal(value[1000000], 'x');
+			assert.ok(!(0 in value));
+			assert.ok(!('foo' in value));
+		});
+
+		it('ignores array properties pretending to be indices', () => {
+			const arr: any = [];
+			arr[1000000] = 'x';
+			arr[-1] = 'negative index';
+			arr[MAX_INDEX + 1] = 'too large index';
+			arr['01'] = 'leading zero';
+
+			assert.equal(devalue(arr), 'Object.assign(Array(1000001),{1000000:"x"})');
+		});
+
+		it('round-trips sparse arrays whose first hole is not at index 0', () => {
+			for (const arr of [[1, , 3], [1, ,], [1, , , 4], [1, 2, , 4]]) {
+				const value = evaluate(devalue(arr));
+				assert.equal(value.length, arr.length, `length for keys ${Object.keys(arr).join(',')}`);
+				assert.deepEqual(Object.keys(value), Object.keys(arr));
+				for (const k of Object.keys(arr)) {
+					assert.equal(value[k], (arr as any)[k]);
+				}
+			}
+		});
 	});
 
 	describe('XSS', () => {

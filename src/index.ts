@@ -44,7 +44,10 @@ export default function devalue(value: any) {
 					return;
 
 				case 'Array':
-					thing.forEach(walk);
+					// Only visit populated indices — Array.prototype.forEach checks
+					// every slot up to thing.length, which is what makes very
+					// sparse arrays (e.g. `arr[1000000] = 1`) expensive to walk
+					validArrayIndices(thing).forEach(i => walk(thing[i]));
 					break;
 
 				case 'Set':
@@ -111,10 +114,83 @@ export default function devalue(value: any) {
 			case 'Date':
 				return `new Date(${thing.getTime()})`;
 
-			case 'Array':
-				const members = thing.map((v: any, i: number) => i in thing ? stringify(v) : '');
+			case 'Array': {
+				// For dense arrays (no holes), we iterate normally.
+				// When we encounter the first hole, we call Object.keys
+				// to determine the sparseness, then decide between:
+				//   - Array literal with holes: [,"a",,] (default)
+				//   - Object.assign: Object.assign(Array(n),{...}) (for very sparse arrays)
+				// Only the Object.assign path avoids iterating every slot, which
+				// is what protects against the DoS of e.g. `arr[1000000] = 1`.
+				let hasHoles = false;
+
+				let result = '[';
+
+				for (let i = 0; i < thing.length; i += 1) {
+					if (i > 0) result += ',';
+
+					if (Object.prototype.hasOwnProperty.call(thing, i)) {
+						result += stringify(thing[i]);
+					} else if (!hasHoles) {
+						// Decide between array literal and Object.assign.
+						//
+						// Array literal: holes are consecutive commas.
+						// For example, [, "a", ,] is written as [,"a",,].
+						// Each hole costs 1 char (a comma).
+						//
+						// Object.assign: populated indices are listed explicitly.
+						// For example, [, "a", ,] would be written as
+						// Object.assign(Array(3),{1:"a"}). This avoids paying
+						// per-hole, but has a large fixed overhead for the
+						// "Object.assign(Array(n),{...})" wrapper, and each
+						// element costs extra chars for its index and colon.
+						//
+						// The serialized values are the same size either way, so
+						// the choice comes down to the structural overhead:
+						//
+						//   Array literal overhead:
+						//     1 char per element or hole (comma separators)
+						//     + 2 chars for "[" and "]"
+						//     = L + 2
+						//
+						//   Object.assign overhead:
+						//     "Object.assign(Array(" — 20 chars
+						//     + length              — d chars
+						//     + "),{"               — 3 chars
+						//     + for each populated element:
+						//       index + ":" + ","   — (d + 2) chars
+						//     + "})"                — 2 chars
+						//     = (25 + d) + P * (d + 2)
+						//
+						// where L is the array length, P is the number of
+						// populated elements, and d is the number of digits
+						// in L (an upper bound on the digits in any index).
+						//
+						// Object.assign is cheaper when:
+						//   (25 + d) + P * (d + 2) < L + 2
+						const populatedKeys = validArrayIndices(thing);
+						const population = populatedKeys.length;
+						const d = String(thing.length).length;
+
+						const holeCost = thing.length + 2;
+						const sparseCost = (25 + d) + population * (d + 2);
+
+						if (holeCost > sparseCost) {
+							const entries = populatedKeys
+								.map(k => `${k}:${stringify(thing[k])}`)
+								.join(',');
+							return `Object.assign(Array(${thing.length}),{${entries}})`;
+						}
+
+						hasHoles = true;
+					}
+					// else: already decided on array literal, hole is just an empty slot
+					// (the comma separator is all we need — no content for this position)
+				}
+
 				const tail = thing.length === 0 || (thing.length - 1 in thing) ? '' : ',';
-				return `[${members.join(',')}${tail}]`;
+				return result + tail + ']';
+			}
 
 			case 'Set':
 			case 'Map':
@@ -167,8 +243,10 @@ export default function devalue(value: any) {
 
 				case 'Array':
 					values.push(`Array(${thing.length})`);
-					thing.forEach((v: any, i: number) => {
-						statements.push(`${name}[${i}]=${stringify(v)}`);
+					// Only visit populated indices, so that very sparse arrays
+					// don't cost time proportional to thing.length
+					validArrayIndices(thing).forEach(i => {
+						statements.push(`${name}[${i}]=${stringify(thing[i])}`);
 					});
 					break;
 
@@ -224,6 +302,35 @@ function stringifyPrimitive(thing: any) {
 
 function getType(thing: any) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
+}
+
+function isValidArrayIndex(s: string) {
+	if (s.length === 0) return false;
+	if (s.length > 1 && s.charCodeAt(0) === 48) return false; // leading zero
+	for (let i = 0; i < s.length; i += 1) {
+		const c = s.charCodeAt(i);
+		if (c < 48 || c > 57) return false;
+	}
+	// by this point we know it's a string of digits, but it has to be within the range of valid array indices
+	const n = +s;
+	if (n >= 4294967295) return false; // 2 ** 32 - 1
+	if (n < 0) return false;
+	return true;
+}
+
+// Finds the populated indices of an array. Object.keys lists the
+// array indices first (in ascending order), followed by any
+// non-numeric properties, which are stripped from the result
+function validArrayIndices(array: any[]) {
+	const keys = Object.keys(array);
+	let i = keys.length - 1;
+	for (; i >= 0; i -= 1) {
+		if (isValidArrayIndex(keys[i])) {
+			break;
+		}
+	}
+	keys.length = i + 1;
+	return keys;
 }
 
 function escapeUnsafeChar(c: string) {
